@@ -3,6 +3,7 @@ import 'dart:math';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 
+import 'online.dart';
 import 'xam_huong_engine.dart';
 import 'xam_huong_game.dart';
 
@@ -106,6 +107,14 @@ class _SetupScreenState extends State<SetupScreen> {
                     padding: EdgeInsets.symmetric(horizontal: 24, vertical: 8),
                     child: Text('Bắt đầu chơi', style: TextStyle(fontSize: 18)),
                   ),
+                ),
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const OnlineMenuScreen()),
+                  ),
+                  icon: const Icon(Icons.public),
+                  label: const Text('Chơi online (2-4 người)'),
                 ),
               ],
             ),
