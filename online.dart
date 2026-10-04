@@ -2,6 +2,9 @@
 //
 // The host's phone runs the game. Other players send a "roll" request, the host
 // rolls and writes a snapshot, and every phone plays the same animation from it.
+// Every phone writes a small "I'm here" beat; the host turns players who have
+// been quiet for 5 minutes (or who left) into bots, and the players cancel the
+// game when the host has been quiet for 10 minutes.
 
 import 'dart:async';
 import 'dart:convert';
@@ -10,6 +13,7 @@ import 'dart:math';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'online_config.dart';
 import 'widgets.dart';
@@ -17,30 +21,76 @@ import 'xam_huong_engine.dart';
 import 'xam_huong_game.dart';
 
 const int maxOnlinePlayers = 4;
+const Duration beatEvery = Duration(seconds: 8);
+const Duration lobbyQuietLimit = Duration(seconds: 30); // host hides ghosts
+const Duration playerAwayLimit = Duration(minutes: 5); // then becomes a bot
+const Duration hostAwayLimit = Duration(minutes: 10); // then game cancelled
+const Duration roomCleanupAge = Duration(hours: 1);
 
 /// Minimal Firebase Realtime Database client (REST API).
 class Db {
-  static Uri _u(String path) {
+  static Uri _u(String path, [String query = '']) {
     final base = firebaseDbUrl.endsWith('/')
         ? firebaseDbUrl.substring(0, firebaseDbUrl.length - 1)
         : firebaseDbUrl;
-    return Uri.parse('$base/$path.json');
+    return Uri.parse('$base/$path.json$query');
   }
 
-  static Future<dynamic> get(String path) async {
-    final r = await http.get(_u(path));
+  static Future<dynamic> get(String path, {String query = ''}) async {
+    final r = await http.get(_u(path, query));
     if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
     return jsonDecode(r.body);
   }
 
-  static Future<void> put(String path, Object? data) async {
+  static Future<dynamic> put(String path, Object? data) async {
     final r = await http.put(_u(path), body: jsonEncode(data));
     if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
+    return jsonDecode(r.body);
   }
 
   static Future<void> delete(String path) async {
     await http.delete(_u(path));
   }
+}
+
+/// What this phone remembers about its online game (players, not hosts).
+class Session {
+  static Future<List<String>?> load() async {
+    final p = await SharedPreferences.getInstance();
+    final code = p.getString('room');
+    final id = p.getString('id');
+    return (code == null || id == null) ? null : [code, id];
+  }
+
+  static Future<void> save(String code, String id) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString('room', code);
+    await p.setString('id', id);
+  }
+
+  static Future<void> clear() async {
+    final p = await SharedPreferences.getInstance();
+    await p.remove('room');
+    await p.remove('id');
+  }
+}
+
+/// Deletes rooms whose host has been silent for over an hour.
+Future<void> cleanOldRooms() async {
+  try {
+    final keys = await Db.get('rooms', query: '?shallow=true');
+    if (keys is! Map || keys.isEmpty) return;
+    final sn = await Db.put('meta/now', {'.sv': 'timestamp'});
+    final now = sn is num ? sn.toInt() : DateTime.now().millisecondsSinceEpoch;
+    var n = 0;
+    for (final code in keys.keys) {
+      if (n++ >= 20) break;
+      final beat = await Db.get('rooms/$code/hostBeat');
+      if (beat is! num || now - beat.toInt() > roomCleanupAge.inMilliseconds) {
+        await Db.delete('rooms/$code');
+      }
+    }
+  } catch (_) {}
 }
 
 void toast(BuildContext context, String message) {
@@ -68,15 +118,18 @@ String resultMessage(TurnOutcome out) {
 }
 
 /// Everything the other phones need to show the game after a turn.
-Map<String, dynamic> snapshotOf(XamHuongGame g, List<String> ids,
-    List<String> names, int seq, TurnOutcome? out) {
+Map<String, dynamic> snapshotOf(
+    XamHuongGame g, List<String> ids, int seq, TurnOutcome? out,
+    {String? notice}) {
   Map<String, int> tiles(Map<Tile, int> m) =>
       {for (final t in Tile.values) t.name: m[t] ?? 0};
   final holder = g.trangHolder;
   return {
     'seq': seq,
     'ids': ids,
-    'names': names,
+    'names': [for (final p in g.players) p.name],
+    'bots': [for (final p in g.players) p.isBot],
+    'notice': notice,
     'current': g.current,
     'over': g.gameOver,
     'stock': tiles(g.bank.stock),
@@ -117,6 +170,18 @@ class _OnlineMenuScreenState extends State<OnlineMenuScreen> {
   final _rng = Random();
   bool _busy = false;
 
+  List<String>? _resume; // [code, id] when there is a game to go back to
+  Map<String, dynamic>? _resumeSnap; // null = back to the waiting room
+
+  @override
+  void initState() {
+    super.initState();
+    if (onlineConfigured) {
+      cleanOldRooms();
+      _checkSession();
+    }
+  }
+
   @override
   void dispose() {
     _name.dispose();
@@ -130,8 +195,91 @@ class _OnlineMenuScreenState extends State<OnlineMenuScreen> {
   // Ids start with a letter so Firebase never turns them into a list.
   String _newId() => 'p${_rng.nextInt(1 << 30).toRadixString(36)}';
 
-  Map<String, dynamic> _playerData() =>
-      {'name': _playerName, 't': DateTime.now().millisecondsSinceEpoch};
+  Map<String, dynamic> _playerData() => {
+        'name': _playerName,
+        't': DateTime.now().millisecondsSinceEpoch,
+        'beat': DateTime.now().millisecondsSinceEpoch,
+      };
+
+  /// Does this phone remember a game it can go back to?
+  Future<void> _checkSession() async {
+    try {
+      final s = await Session.load();
+      if (s == null) return;
+      final room = await Db.get('rooms/${s[0]}');
+      final players = room is Map ? room['players'] : null;
+      if (room is! Map || players is! Map || !players.containsKey(s[1])) {
+        await Session.clear();
+        return;
+      }
+      if (room['status'] != 'playing') {
+        if (mounted) setState(() => _resume = s);
+        return;
+      }
+      final raw = room['state'];
+      if (raw is! String) return;
+      final snap = jsonDecode(raw) as Map<String, dynamic>;
+      final idx = List<String>.from(snap['ids'] as List).indexOf(s[1]);
+      final bots = (snap['bots'] as List?) ?? const [];
+      if (idx < 0 || (idx < bots.length && bots[idx] == true)) {
+        await Session.clear();
+        if (mounted) {
+          toast(context, 'Bạn đã vắng quá 5 phút nên bot đã chơi thay bạn.');
+        }
+        return;
+      }
+      if (snap['over'] == true) {
+        await Session.clear();
+        return;
+      }
+      if (mounted) {
+        setState(() {
+          _resume = s;
+          _resumeSnap = snap;
+        });
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _doResume() async {
+    final s = _resume!;
+    final snap = _resumeSnap;
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => snap == null
+          ? OnlineLobbyScreen(code: s[0], myId: s[1], isHost: false)
+          : OnlineGameScreen(
+              code: s[0], myId: s[1], isHost: false, initial: snap),
+    ));
+    if (!mounted) return;
+    setState(() {
+      _resume = null;
+      _resumeSnap = null;
+    });
+    _checkSession();
+  }
+
+  /// Starting or joining another room gives up the old seat: it turns into a bot.
+  Future<void> _abandonOld() async {
+    final s = await Session.load();
+    if (s == null) return;
+    try {
+      final room = await Db.get('rooms/${s[0]}');
+      if (room is Map) {
+        if (room['status'] == 'playing') {
+          await Db.put('rooms/${s[0]}/players/${s[1]}/left', true);
+        } else {
+          await Db.delete('rooms/${s[0]}/players/${s[1]}');
+        }
+      }
+    } catch (_) {}
+    await Session.clear();
+    if (mounted) {
+      setState(() {
+        _resume = null;
+        _resumeSnap = null;
+      });
+    }
+  }
 
   Future<void> _create() async {
     if (!onlineConfigured) {
@@ -140,6 +288,7 @@ class _OnlineMenuScreenState extends State<OnlineMenuScreen> {
     }
     setState(() => _busy = true);
     try {
+      await _abandonOld();
       const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
       String code;
       do {
@@ -150,6 +299,7 @@ class _OnlineMenuScreenState extends State<OnlineMenuScreen> {
       await Db.put('rooms/$code', {
         'host': id,
         'status': 'lobby',
+        'hostBeat': {'.sv': 'timestamp'},
         'players': {id: _playerData()},
       });
       if (!mounted) return;
@@ -176,6 +326,10 @@ class _OnlineMenuScreenState extends State<OnlineMenuScreen> {
       toast(context, 'Nhập mã phòng gồm 4 ký tự.');
       return;
     }
+    if (_resume != null && _resume![0] == code) {
+      _doResume(); // typing the code of your own game goes back to it
+      return;
+    }
     setState(() => _busy = true);
     try {
       final room = await Db.get('rooms/$code');
@@ -192,8 +346,10 @@ class _OnlineMenuScreenState extends State<OnlineMenuScreen> {
         if (mounted) toast(context, 'Phòng đã đủ $maxOnlinePlayers người.');
         return;
       }
+      await _abandonOld();
       final id = _newId();
       await Db.put('rooms/$code/players/$id', _playerData());
+      await Session.save(code, id);
       if (!mounted) return;
       Navigator.of(context).push(MaterialPageRoute(
         builder: (_) =>
@@ -221,6 +377,18 @@ class _OnlineMenuScreenState extends State<OnlineMenuScreen> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  if (_resume != null) ...[
+                    FilledButton.icon(
+                      onPressed: _doResume,
+                      icon: const Icon(Icons.replay),
+                      label: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        child: Text('Quay lại phòng ${_resume![0]}',
+                            style: const TextStyle(fontSize: 18)),
+                      ),
+                    ),
+                    const SizedBox(height: 28),
+                  ],
                   TextField(
                     controller: _name,
                     maxLength: 12,
@@ -302,6 +470,10 @@ class _OnlineLobbyScreenState extends State<OnlineLobbyScreen> {
   List<MapEntry<String, String>> _players = [];
   String _hostId = '';
 
+  DateTime _lastBeatWrite = DateTime.fromMillisecondsSinceEpoch(0);
+  final Map<String, dynamic> _lastBeat = {};
+  final Map<String, DateTime> _seenAt = {};
+
   @override
   void initState() {
     super.initState();
@@ -315,6 +487,18 @@ class _OnlineLobbyScreenState extends State<OnlineLobbyScreen> {
     super.dispose();
   }
 
+  Future<void> _sendBeat() async {
+    final now = DateTime.now();
+    if (now.difference(_lastBeatWrite) < beatEvery) return;
+    _lastBeatWrite = now;
+    if (widget.isHost) {
+      await Db.put('rooms/${widget.code}/hostBeat', {'.sv': 'timestamp'});
+    } else {
+      await Db.put('rooms/${widget.code}/players/${widget.myId}/beat',
+          now.millisecondsSinceEpoch);
+    }
+  }
+
   Future<void> _poll() async {
     if (_polling || _leaving) return;
     _polling = true;
@@ -325,11 +509,14 @@ class _OnlineLobbyScreenState extends State<OnlineLobbyScreen> {
       if (room is! Map) {
         if (!widget.isHost) {
           _leaving = true;
+          await Session.clear();
+          if (!mounted) return;
           toast(context, 'Phòng đã đóng.');
           Navigator.of(context).pop();
         }
         return;
       }
+      final now = DateTime.now();
       final list = <MapEntry<String, Map>>[];
       final pm = room['players'];
       if (pm is Map) {
@@ -339,16 +526,38 @@ class _OnlineLobbyScreenState extends State<OnlineLobbyScreen> {
       }
       list.sort((a, b) =>
           ((a.value['t'] ?? 0) as num).compareTo((b.value['t'] ?? 0) as num));
+      final hostId = '${room['host']}';
+      // Hide players whose phone went quiet (closed the app in the lobby).
+      final shown = <MapEntry<String, String>>[];
+      for (final e in list) {
+        final beat = e.value['beat'];
+        if (beat != _lastBeat[e.key]) {
+          _lastBeat[e.key] = beat;
+          _seenAt[e.key] = now;
+        }
+        final quiet = now.difference(_seenAt[e.key] ?? now) > lobbyQuietLimit;
+        if (e.key == hostId || e.key == widget.myId || !quiet) {
+          shown.add(MapEntry(e.key, '${e.value['name']}'));
+        }
+      }
       setState(() {
-        _hostId = '${room['host']}';
-        _players = [for (final e in list) MapEntry(e.key, '${e.value['name']}')];
+        _hostId = hostId;
+        _players = shown;
       });
+      await _sendBeat();
       if (room['status'] == 'playing' && !widget.isHost) {
         _leaving = true;
         joining = true;
         final raw = await Db.get('rooms/${widget.code}/state');
         final snap = jsonDecode(raw as String) as Map<String, dynamic>;
         if (!mounted) return;
+        if (!List<String>.from(snap['ids'] as List).contains(widget.myId)) {
+          await Session.clear();
+          if (!mounted) return;
+          toast(context, 'Ván đã bắt đầu mà không có bạn.');
+          Navigator.of(context).pop();
+          return;
+        }
         Navigator.of(context).pushReplacement(MaterialPageRoute(
           builder: (_) => OnlineGameScreen(
             code: widget.code,
@@ -373,7 +582,7 @@ class _OnlineLobbyScreenState extends State<OnlineLobbyScreen> {
       final ids = [for (final e in _players) e.key];
       final names = [for (final e in _players) e.value];
       final game = XamHuongGame([for (final n in names) Player(n)]);
-      final snap = snapshotOf(game, ids, names, 0, null);
+      final snap = snapshotOf(game, ids, 0, null);
       await Db.put('rooms/${widget.code}/state', jsonEncode(snap));
       await Db.put('rooms/${widget.code}/status', 'playing');
       if (!mounted) return;
@@ -401,6 +610,7 @@ class _OnlineLobbyScreenState extends State<OnlineLobbyScreen> {
         await Db.delete('rooms/${widget.code}');
       } else {
         await Db.delete('rooms/${widget.code}/players/${widget.myId}');
+        await Session.clear();
       }
     } catch (_) {}
     if (mounted) Navigator.of(context).pop();
@@ -409,62 +619,69 @@ class _OnlineLobbyScreenState extends State<OnlineLobbyScreen> {
   @override
   Widget build(BuildContext context) {
     final canStart = widget.isHost && _players.length >= 2 && !_leaving;
-    return Scaffold(
-      appBar: AppBar(title: const Text('Phòng chờ')),
-      body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 360),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Text('Mã phòng'),
-                  SelectableText(
-                    widget.code,
-                    style: const TextStyle(
-                        fontSize: 56,
-                        fontWeight: FontWeight.bold,
-                        letterSpacing: 8),
-                  ),
-                  const SizedBox(height: 4),
-                  Text('Người chơi (${_players.length}/$maxOnlinePlayers)'),
-                  const SizedBox(height: 8),
-                  for (final p in _players)
-                    Card(
-                      child: ListTile(
-                        dense: true,
-                        leading: Icon(
-                            p.key == _hostId ? Icons.star : Icons.person),
-                        title: Text(
-                            '${p.value}${p.key == widget.myId ? ' (bạn)' : ''}'),
-                        trailing:
-                            p.key == _hostId ? const Text('Chủ phòng') : null,
-                      ),
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) _leave();
+      },
+      child: Scaffold(
+        appBar: AppBar(title: const Text('Phòng chờ')),
+        body: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 360),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('Mã phòng'),
+                    SelectableText(
+                      widget.code,
+                      style: const TextStyle(
+                          fontSize: 56,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 8),
                     ),
-                  const SizedBox(height: 16),
-                  if (widget.isHost)
-                    FilledButton(
-                      onPressed: canStart ? _start : null,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 24, vertical: 8),
-                        child: Text(
-                            _players.length < 2
-                                ? 'Cần ít nhất 2 người'
-                                : 'Bắt đầu chơi',
-                            style: const TextStyle(fontSize: 18)),
+                    const SizedBox(height: 4),
+                    Text('Người chơi (${_players.length}/$maxOnlinePlayers)'),
+                    const SizedBox(height: 8),
+                    for (final p in _players)
+                      Card(
+                        child: ListTile(
+                          dense: true,
+                          leading: Icon(
+                              p.key == _hostId ? Icons.star : Icons.person),
+                          title: Text(
+                              '${p.value}${p.key == widget.myId ? ' (bạn)' : ''}'),
+                          trailing: p.key == _hostId
+                              ? const Text('Chủ phòng')
+                              : null,
+                        ),
                       ),
-                    )
-                  else
-                    const Text('Đang chờ chủ phòng bắt đầu...'),
-                  const SizedBox(height: 12),
-                  TextButton(
-                    onPressed: _leave,
-                    child: Text(widget.isHost ? 'Hủy phòng' : 'Rời phòng'),
-                  ),
-                ],
+                    const SizedBox(height: 16),
+                    if (widget.isHost)
+                      FilledButton(
+                        onPressed: canStart ? _start : null,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 24, vertical: 8),
+                          child: Text(
+                              _players.length < 2
+                                  ? 'Cần ít nhất 2 người'
+                                  : 'Bắt đầu chơi',
+                              style: const TextStyle(fontSize: 18)),
+                        ),
+                      )
+                    else
+                      const Text('Đang chờ chủ phòng bắt đầu...'),
+                    const SizedBox(height: 12),
+                    TextButton(
+                      onPressed: _leave,
+                      child: Text(widget.isHost ? 'Hủy phòng' : 'Rời phòng'),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -503,6 +720,8 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
 
   Timer? _timer;
   bool _ticking = false;
+  DateTime _now = DateTime.now();
+  DateTime _lastBeatWrite = DateTime.fromMillisecondsSinceEpoch(0);
 
   late List<String> ids;
   late List<String> names;
@@ -514,12 +733,21 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
   Map<String, dynamic>? _unsent; // host: snapshot not yet in the database
   bool _draining = false;
 
+  // Who has been quiet (observed on this phone, so no clock differences).
+  dynamic _lastHostBeat;
+  DateTime _hostSeenAt = DateTime.now();
+  final Map<String, dynamic> _lastBeat = {};
+  final Map<String, DateTime> _seenAt = {};
+
   Set<Tile> glowing = {};
   Set<int> glowingPlayers = {};
   List<int> faces = [1, 2, 3, 4, 5, 6];
   List<double> angles = List.filled(6, 0.0);
   bool busy = false;
   bool waitingRoll = false;
+  bool _cancelled = false; // the host is gone
+  bool _kicked = false; // we were away too long and a bot took over
+  bool _cleaned = false;
   String message = '';
 
   XamHuongGame? get _game => widget.game;
@@ -533,6 +761,7 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     _seq = snap['seq'] as int;
     _receivedSeq = _seq;
     message = _turnText(snap);
+    if (!widget.isHost) Session.save(widget.code, widget.myId);
     _timer = Timer.periodic(const Duration(milliseconds: 800), (_) => _tick());
   }
 
@@ -550,6 +779,13 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
   int get _current => snap['current'] as int;
   bool get _over => snap['over'] == true;
   List get _players => snap['players'] as List;
+  bool get _canLeave => _over || _cancelled || _kicked;
+
+  bool get _meBot {
+    final b = (snap['bots'] as List?) ?? const [];
+    final i = _myIdx;
+    return i >= 0 && i < b.length && b[i] == true;
+  }
 
   String _turnText(Map<String, dynamic> s) {
     final cur = s['current'] as int;
@@ -573,19 +809,69 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     if (_ticking) return;
     _ticking = true;
     try {
+      final room = await Db.get('rooms/${widget.code}');
+      if (!mounted) return;
+      _now = DateTime.now();
+      if (room is! Map) {
+        if (!_over && !_draining && _pending == null) _cancel();
+        return;
+      }
       if (widget.isHost) {
-        await _flush();
-        await _hostCheck();
+        await _hostTick(room);
+      } else {
+        _clientTick(room);
       }
-      final raw = await Db.get('rooms/${widget.code}/state');
-      if (raw is String && mounted) {
-        _receive(jsonDecode(raw) as Map<String, dynamic>);
-      }
+      final raw = room['state'];
+      if (raw is String) _receive(jsonDecode(raw) as Map<String, dynamic>);
+      await _beat();
     } catch (_) {
       // Network hiccup: try again on the next tick.
     } finally {
       _ticking = false;
     }
+  }
+
+  Future<void> _beat() async {
+    if (_now.difference(_lastBeatWrite) < beatEvery) return;
+    _lastBeatWrite = _now;
+    if (widget.isHost) {
+      await Db.put('rooms/${widget.code}/hostBeat', {'.sv': 'timestamp'});
+    } else {
+      await Db.put('rooms/${widget.code}/players/${widget.myId}/beat',
+          _now.millisecondsSinceEpoch);
+    }
+  }
+
+  /// Player side: has the host been quiet for too long?
+  void _clientTick(Map room) {
+    final hb = room['hostBeat'];
+    if (hb != _lastHostBeat) {
+      _lastHostBeat = hb;
+      _hostSeenAt = _now;
+    } else if (!_over && _now.difference(_hostSeenAt) > hostAwayLimit) {
+      _cancel();
+    }
+  }
+
+  void _cancel() {
+    if (_cancelled || _kicked) return;
+    _timer?.cancel();
+    Session.clear();
+    setState(() {
+      _cancelled = true;
+      busy = false;
+      message = 'Chủ phòng đã thoát, ván đấu bị hủy';
+    });
+  }
+
+  void _kick() {
+    if (_kicked) return;
+    _timer?.cancel();
+    Session.clear();
+    setState(() {
+      _kicked = true;
+      message = 'Bạn đã vắng quá 5 phút nên bot đã chơi thay bạn.';
+    });
   }
 
   Future<void> _flush() async {
@@ -595,21 +881,63 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     if (identical(_unsent, s)) _unsent = null;
   }
 
-  /// Host: is there a valid roll request from the player whose turn it is?
-  Future<void> _hostCheck() async {
-    final g = _game;
-    if (g == null || _draining || g.gameOver || _unsent != null) return;
-    final cmd = await Db.get('rooms/${widget.code}/cmd');
+  /// Host: bots play, absent players become bots, roll requests are served.
+  Future<void> _hostTick(Map room) async {
+    final g = _game!;
+    await _flush();
+    if (g.gameOver || _draining || _unsent != null) return;
+
+    // Players who left or have been quiet for 5 minutes become bots.
+    final pm = room['players'];
+    if (pm is Map) {
+      for (var i = 0; i < ids.length; i++) {
+        final p = g.players[i];
+        if (p.isBot || ids[i] == widget.myId) continue;
+        final d = pm[ids[i]];
+        if (d is! Map) continue;
+        final beat = d['beat'];
+        if (beat != _lastBeat[ids[i]]) {
+          _lastBeat[ids[i]] = beat;
+          _seenAt[ids[i]] = _now;
+        }
+        final quiet = _now.difference(_seenAt[ids[i]] ?? _now) > playerAwayLimit;
+        if (d['left'] == true || quiet) {
+          await _convert(i);
+          return;
+        }
+      }
+    }
+
+    // A bot's turn: roll for it.
+    if (g.currentPlayer.isBot) {
+      await _hostPlay();
+      return;
+    }
+
+    // A real player asked to roll.
+    final cmd = room['cmd'];
     if (cmd is! Map || cmd['seq'] != _seq + 1) return;
     if (ids.indexOf('${cmd['by']}') != g.current) return;
     await _hostPlay();
+  }
+
+  Future<void> _convert(int i) async {
+    final g = _game!;
+    final old = g.players[i].name;
+    g.convertToBot(i);
+    _seq++;
+    final s = snapshotOf(g, ids, _seq, null,
+        notice: '$old đã thoát. ${g.players[i].name} chơi thay.');
+    _unsent = s;
+    _receive(s);
+    await _flush();
   }
 
   Future<void> _hostPlay() async {
     final g = _game!;
     final out = g.playTurn();
     _seq++;
-    final s = snapshotOf(g, ids, names, _seq, out);
+    final s = snapshotOf(g, ids, _seq, out);
     _unsent = s;
     _receive(s);
     await _flush();
@@ -654,12 +982,14 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
   }
 
   Future<void> _apply(Map<String, dynamic> s) async {
+    names = List<String>.from(s['names'] as List);
     final last = s['last'];
     if (last is! Map) {
       setState(() {
         snap = s;
-        message = _turnText(s);
+        message = (s['notice'] as String?) ?? _turnText(s);
       });
+      if (_meBot) _kick();
       return;
     }
     final by = last['by'] as int;
@@ -699,10 +1029,16 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     await _wait(500);
     if (!mounted) return;
     setState(() => busy = false);
-    if (s['over'] == true) _endGame();
+    if (s['over'] == true) {
+      _endGame();
+    } else if (_meBot) {
+      _kick();
+    }
   }
 
   void _endGame() {
+    _timer?.cancel();
+    Session.clear();
     final scores = [for (final p in _players) (p as Map)['score'] as int];
     if (scores[_myIdx] == scores.reduce(max)) {
       _sfx.play(AssetSource('sounds/applause.wav'));
@@ -741,13 +1077,52 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     );
   }
 
-  Future<void> _exit() async {
+  // ---- leaving
+
+  Future<void> _cleanup() async {
+    if (_cleaned) return;
+    _cleaned = true;
+    _timer?.cancel();
+    await Session.clear();
     if (widget.isHost) {
       try {
         await Db.delete('rooms/${widget.code}');
       } catch (_) {}
     }
+  }
+
+  Future<void> _exit() async {
+    await _cleanup();
     if (mounted) Navigator.of(context).popUntil((r) => r.isFirst);
+  }
+
+  Future<void> _confirmLeave() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(widget.isHost ? 'Hủy ván?' : 'Rời ván?'),
+        content: Text(widget.isHost
+            ? 'Ván sẽ bị hủy cho tất cả mọi người.'
+            : 'Bạn sẽ không vào lại được, bot sẽ chơi thay bạn.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Ở lại'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Đồng ý'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    if (!widget.isHost) {
+      try {
+        await Db.put('rooms/${widget.code}/players/${widget.myId}/left', true);
+      } catch (_) {}
+    }
+    await _exit();
   }
 
   @override
@@ -757,74 +1132,95 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     final myTurn = !busy &&
         !waitingRoll &&
         !_draining &&
-        !_over &&
+        !_canLeave &&
         _current == _myIdx;
-    final status = _over
+    final status = _canLeave
         ? ''
         : myTurn
             ? 'Tới lượt bạn'
             : (busy || _draining ? '' : 'Chờ ${names[_current]} gieo...');
-    return Scaffold(
-      appBar: AppBar(title: Text('Phòng ${widget.code}')),
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            children: [
-              BankGrid(
-                stock: _tiles(snap['stock']),
-                glowing: glowing,
-                discount: snap['discount'] as int,
+    return PopScope(
+      canPop: _canLeave,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) _cleanup();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          automaticallyImplyLeading: _canLeave,
+          title: Text('Phòng ${widget.code}'),
+          actions: [
+            if (!_canLeave)
+              PopupMenuButton<String>(
+                onSelected: (_) => _confirmLeave(),
+                itemBuilder: (_) => [
+                  PopupMenuItem(
+                    value: 'leave',
+                    child: Text(widget.isHost ? 'Hủy ván' : 'Rời ván'),
+                  ),
+                ],
               ),
-              const SizedBox(height: 12),
-              DiceBowl(faces: faces, angles: angles),
-              const SizedBox(height: 12),
-              SizedBox(
-                height: 84,
-                child: Center(
-                  child: Text(
-                    message,
-                    textAlign: TextAlign.center,
-                    maxLines: 4,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 16),
+          ],
+        ),
+        body: SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              children: [
+                BankGrid(
+                  stock: _tiles(snap['stock']),
+                  glowing: glowing,
+                  discount: snap['discount'] as int,
+                ),
+                const SizedBox(height: 12),
+                DiceBowl(faces: faces, angles: angles),
+                const SizedBox(height: 12),
+                SizedBox(
+                  height: 84,
+                  child: Center(
+                    child: Text(
+                      message,
+                      textAlign: TextAlign.center,
+                      maxLines: 4,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 16),
+                    ),
                   ),
                 ),
-              ),
-              SizedBox(
-                height: 24,
-                child: Text(status, style: const TextStyle(fontSize: 13)),
-              ),
-              FilledButton(
-                onPressed: _over ? _exit : (myTurn ? _roll : null),
-                child: Padding(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
-                  child: Text(_over ? 'Thoát' : 'Gieo',
-                      style: const TextStyle(fontSize: 22)),
+                SizedBox(
+                  height: 24,
+                  child: Text(status, style: const TextStyle(fontSize: 13)),
                 ),
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                onPressed: _over ? _showResult : null,
-                style: OutlinedButton.styleFrom(
-                  visualDensity: VisualDensity.compact,
-                  textStyle: const TextStyle(fontSize: 13),
+                FilledButton(
+                  onPressed: _canLeave ? _exit : (myTurn ? _roll : null),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 40, vertical: 10),
+                    child: Text(_canLeave ? 'Thoát' : 'Gieo',
+                        style: const TextStyle(fontSize: 22)),
+                  ),
                 ),
-                icon: const Icon(Icons.emoji_events, size: 18),
-                label: const Text('Xem kết quả'),
-              ),
-              const SizedBox(height: 16),
-              for (var i = 0; i < _players.length; i++)
-                PlayerTile(
-                  name: names[i] + (i == _myIdx ? ' (bạn)' : ''),
-                  tiles: tilesText(_tiles((_players[i] as Map)['tiles']),
-                      i == trangIdx ? trangLabel : ''),
-                  score: (_players[i] as Map)['score'] as int,
-                  current: i == _current && !_over,
-                  glow: glowingPlayers.contains(i),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: _over ? _showResult : null,
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    textStyle: const TextStyle(fontSize: 13),
+                  ),
+                  icon: const Icon(Icons.emoji_events, size: 18),
+                  label: const Text('Xem kết quả'),
                 ),
-            ],
+                const SizedBox(height: 16),
+                for (var i = 0; i < _players.length; i++)
+                  PlayerTile(
+                    name: names[i] + (i == _myIdx ? ' (bạn)' : ''),
+                    tiles: tilesText(_tiles((_players[i] as Map)['tiles']),
+                        i == trangIdx ? trangLabel : ''),
+                    score: (_players[i] as Map)['score'] as int,
+                    current: i == _current && !_over,
+                    glow: glowingPlayers.contains(i),
+                  ),
+              ],
+            ),
           ),
         ),
       ),

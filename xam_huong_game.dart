@@ -5,8 +5,8 @@ import 'dart:math';
 import 'xam_huong_engine.dart';
 
 class Player {
-  final String name;
-  final bool isBot;
+  String name;
+  bool isBot;
   final Map<Tile, int> tiles = {for (final t in Tile.values) t: 0};
 
   /// Set by Lục Phú Hường (382); otherwise the score comes from the tiles.
@@ -64,6 +64,14 @@ class XamHuongGame {
   }
 
   Player get currentPlayer => players[current];
+
+  /// A player who left: renamed "Bot <name>" and played by the host from now on.
+  void convertToBot(int i) {
+    final p = players[i];
+    if (p.isBot) return;
+    p.name = 'Bot ${p.name}';
+    p.isBot = true;
+  }
 
   List<Player> get winners {
     final best = players.map((p) => p.score).reduce(max);
