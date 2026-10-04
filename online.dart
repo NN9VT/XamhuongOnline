@@ -1145,27 +1145,32 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
         if (didPop) _cleanup();
       },
       child: Scaffold(
-        appBar: AppBar(
-          automaticallyImplyLeading: _canLeave,
-          title: Text('Phòng ${widget.code}'),
-          actions: [
-            if (!_canLeave)
-              PopupMenuButton<String>(
-                onSelected: (_) => _confirmLeave(),
-                itemBuilder: (_) => [
-                  PopupMenuItem(
-                    value: 'leave',
-                    child: Text(widget.isHost ? 'Hủy ván' : 'Rời ván'),
-                  ),
+        body: SafeArea(
+          top: false,
+          child: CustomScrollView(
+            slivers: [
+              // Scrolls away with the page; shows again at the top of the page.
+              SliverAppBar(
+                automaticallyImplyLeading: _canLeave,
+                title: Text('Phòng ${widget.code}'),
+                actions: [
+                  if (!_canLeave)
+                    PopupMenuButton<String>(
+                      onSelected: (_) => _confirmLeave(),
+                      itemBuilder: (_) => [
+                        PopupMenuItem(
+                          value: 'leave',
+                          child: Text(widget.isHost ? 'Hủy ván' : 'Rời ván'),
+                        ),
+                      ],
+                    ),
                 ],
               ),
-          ],
-        ),
-        body: SafeArea(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              children: [
+              SliverPadding(
+                padding: const EdgeInsets.all(12),
+                sliver: SliverToBoxAdapter(
+                  child: Column(
+                    children: [
                 BankGrid(
                   stock: _tiles(snap['stock']),
                   glowing: glowing,
@@ -1219,11 +1224,14 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
                     current: i == _current && !_over,
                     glow: glowingPlayers.contains(i),
                   ),
-              ],
+                ],
+              ),
             ),
           ),
-        ),
+        ],
       ),
-    );
+    ),
+  ),
+);
   }
 }
