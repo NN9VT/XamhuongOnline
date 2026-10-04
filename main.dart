@@ -253,6 +253,10 @@ class _GameScreenState extends State<GameScreen> {
         out.roll.winEverything ||
         out.roll.winAllRemaining;
     final big = out.award.points > 16 || out.stolenPoints > 16;
+    // 32 points or more (Trạng Nguyên and up, steals, Lục Phú...): stay longer.
+    final huge = out.award.points + out.stolenPoints >= 32 ||
+        out.roll.winEverything ||
+        out.roll.winAllRemaining;
     setState(() {
       faces = out.roll.dice;
       angles = List.filled(6, 0.0);
@@ -282,6 +286,10 @@ class _GameScreenState extends State<GameScreen> {
     });
     await _wait(500);
     if (!mounted) return;
+    if (huge) {
+      await _wait(3000);
+      if (!mounted) return;
+    }
 
     setState(() {
       rolling = false;

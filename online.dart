@@ -15,6 +15,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'chat.dart';
 import 'online_config.dart';
 import 'widgets.dart';
 import 'xam_huong_engine.dart';
@@ -48,6 +49,12 @@ class Db {
     return jsonDecode(r.body);
   }
 
+  static Future<dynamic> post(String path, Object? data) async {
+    final r = await http.post(_u(path), body: jsonEncode(data));
+    if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
+    return jsonDecode(r.body);
+  }
+
   static Future<void> delete(String path) async {
     await http.delete(_u(path));
   }
@@ -75,19 +82,32 @@ class Session {
   }
 }
 
-/// Deletes rooms whose host has been silent for over an hour.
+/// Deletes rooms whose host has been silent for over an hour (and their chat),
+/// and chat messages whose room no longer exists.
 Future<void> cleanOldRooms() async {
   try {
-    final keys = await Db.get('rooms', query: '?shallow=true');
-    if (keys is! Map || keys.isEmpty) return;
-    final sn = await Db.put('meta/now', {'.sv': 'timestamp'});
-    final now = sn is num ? sn.toInt() : DateTime.now().millisecondsSinceEpoch;
-    var n = 0;
-    for (final code in keys.keys) {
-      if (n++ >= 20) break;
-      final beat = await Db.get('rooms/$code/hostBeat');
-      if (beat is! num || now - beat.toInt() > roomCleanupAge.inMilliseconds) {
-        await Db.delete('rooms/$code');
+    final rooms = await Db.get('rooms', query: '?shallow=true');
+    final roomKeys =
+        rooms is Map ? rooms.keys.map((k) => '$k').toSet() : <String>{};
+    if (roomKeys.isNotEmpty) {
+      final sn = await Db.put('meta/now', {'.sv': 'timestamp'});
+      final now =
+          sn is num ? sn.toInt() : DateTime.now().millisecondsSinceEpoch;
+      var n = 0;
+      for (final code in roomKeys) {
+        if (n++ >= 20) break;
+        final beat = await Db.get('rooms/$code/hostBeat');
+        if (beat is! num ||
+            now - beat.toInt() > roomCleanupAge.inMilliseconds) {
+          await Db.delete('rooms/$code');
+          await Db.delete('chat/$code');
+        }
+      }
+    }
+    final chats = await Db.get('chat', query: '?shallow=true');
+    if (chats is Map) {
+      for (final c in chats.keys) {
+        if (!roomKeys.contains('$c')) await Db.delete('chat/$c');
       }
     }
   } catch (_) {}
@@ -151,6 +171,9 @@ Map<String, dynamic> snapshotOf(
             ],
             'victims': [for (final v in out.victims) g.players.indexOf(v)],
             'big': out.award.points > 16 || out.stolenPoints > 16,
+            'huge': out.award.points + out.stolenPoints >= 32 ||
+                out.roll.winEverything ||
+                out.roll.winAllRemaining,
           },
   };
 }
@@ -744,11 +767,20 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
   List<int> faces = [1, 2, 3, 4, 5, 6];
   List<double> angles = List.filled(6, 0.0);
   bool busy = false;
+  int? _highlight; // the roller stays highlighted during the pause
   bool waitingRoll = false;
   bool _cancelled = false; // the host is gone
   bool _kicked = false; // we were away too long and a bot took over
   bool _cleaned = false;
   String message = '';
+
+  // chat
+  final _danmaku = GlobalKey<DanmakuLayerState>();
+  bool _danmakuOn = true;
+  Offset? _chatPos;
+  String? _lastChatKey;
+  int _tickCount = 0;
+  DateTime _lastSent = DateTime.fromMillisecondsSinceEpoch(0);
 
   XamHuongGame? get _game => widget.game;
 
@@ -762,6 +794,7 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     _receivedSeq = _seq;
     message = _turnText(snap);
     if (!widget.isHost) Session.save(widget.code, widget.myId);
+    _loadChatPrefs();
     _timer = Timer.periodic(const Duration(milliseconds: 800), (_) => _tick());
   }
 
@@ -824,6 +857,7 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
       final raw = room['state'];
       if (raw is String) _receive(jsonDecode(raw) as Map<String, dynamic>);
       await _beat();
+      if (_tickCount++ % 2 == 0) await _pollChat();
     } catch (_) {
       // Network hiccup: try again on the next tick.
     } finally {
@@ -995,6 +1029,7 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     final by = last['by'] as int;
     setState(() {
       busy = true;
+      _highlight = by;
       message = '${names[by]} đang gieo...';
     });
     for (var i = 0; i < 12; i++) {
@@ -1028,7 +1063,14 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     });
     await _wait(500);
     if (!mounted) return;
-    setState(() => busy = false);
+    if (last['huge'] == true) {
+      await _wait(3000); // 32+ points: stay a bit longer
+      if (!mounted) return;
+    }
+    setState(() {
+      busy = false;
+      _highlight = null;
+    });
     if (s['over'] == true) {
       _endGame();
     } else if (_meBot) {
@@ -1077,6 +1119,83 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     );
   }
 
+  // ---- chat
+
+  Future<void> _loadChatPrefs() async {
+    final p = await SharedPreferences.getInstance();
+    final x = p.getDouble('chatx');
+    final y = p.getDouble('chaty');
+    if (!mounted) return;
+    setState(() {
+      _danmakuOn = p.getBool('danmaku') ?? true;
+      if (x != null && y != null) _chatPos = Offset(x, y);
+    });
+  }
+
+  Future<void> _saveChatPos(Offset o) async {
+    setState(() => _chatPos = o);
+    final p = await SharedPreferences.getInstance();
+    await p.setDouble('chatx', o.dx);
+    await p.setDouble('chaty', o.dy);
+  }
+
+  Future<void> _setDanmaku(bool v) async {
+    setState(() => _danmakuOn = v);
+    final p = await SharedPreferences.getInstance();
+    await p.setBool('danmaku', v);
+  }
+
+  /// Returns an error text, or null when the message was sent.
+  String? _sendChat(String raw) {
+    final text = raw.trim();
+    if (text.isEmpty) return 'Nhập nội dung trước nhé.';
+    final now = DateTime.now();
+    if (now.difference(_lastSent) < const Duration(milliseconds: 1500)) {
+      return 'Gửi chậm lại một chút nhé.';
+    }
+    _lastSent = now;
+    _danmaku.currentState?.add('Bạn: $text');
+    final name = _myIdx >= 0 ? names[_myIdx] : 'Người chơi';
+    Db.post('chat/${widget.code}', {'i': widget.myId, 'n': name, 't': text})
+        .catchError((_) {});
+    return null;
+  }
+
+  void _openChat() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => ChatSheet(
+        onSend: _sendChat,
+        danmakuOn: _danmakuOn,
+        onToggle: _setDanmaku,
+      ),
+    );
+  }
+
+  /// Shows messages that arrived since the last look (no history on entering).
+  Future<void> _pollChat() async {
+    final data = await Db.get('chat/${widget.code}',
+        query: '?orderBy=%22%24key%22&limitToLast=10');
+    if (data is! Map || data.isEmpty) {
+      _lastChatKey ??= '';
+      return;
+    }
+    final keys = data.keys.map((k) => '$k').toList()..sort();
+    if (_lastChatKey == null) {
+      _lastChatKey = keys.last;
+      return;
+    }
+    for (final k in keys) {
+      if (k.compareTo(_lastChatKey!) <= 0) continue;
+      final m = data[k];
+      if (m is Map && m['i'] != widget.myId) {
+        _danmaku.currentState?.add('${m['n']}: ${m['t']}');
+      }
+      _lastChatKey = k;
+    }
+  }
+
   // ---- leaving
 
   Future<void> _cleanup() async {
@@ -1087,6 +1206,7 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
     if (widget.isHost) {
       try {
         await Db.delete('rooms/${widget.code}');
+        await Db.delete('chat/${widget.code}');
       } catch (_) {}
     }
   }
@@ -1145,7 +1265,9 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
         if (didPop) _cleanup();
       },
       child: Scaffold(
-        body: SafeArea(
+        body: Stack(
+          children: [
+          SafeArea(
           top: false,
           child: CustomScrollView(
             slivers: [
@@ -1221,7 +1343,7 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
                     tiles: tilesText(_tiles((_players[i] as Map)['tiles']),
                         i == trangIdx ? trangLabel : ''),
                     score: (_players[i] as Map)['score'] as int,
-                    current: i == _current && !_over,
+                    current: i == (_highlight ?? _current) && !_over,
                     glow: glowingPlayers.contains(i),
                   ),
                 ],
@@ -1231,7 +1353,26 @@ class _OnlineGameScreenState extends State<OnlineGameScreen> {
         ],
       ),
     ),
-  ),
-);
+          Positioned.fill(
+            child: IgnorePointer(
+              child: DanmakuLayer(
+                key: _danmaku,
+                enabled: _danmakuOn,
+                topOffset: MediaQuery.of(context).padding.top + 64,
+              ),
+            ),
+          ),
+          if (!_canLeave)
+            Positioned.fill(
+              child: ChatButton(
+                initial: _chatPos,
+                onTap: _openChat,
+                onMoved: _saveChatPos,
+              ),
+            ),
+        ],
+      ),
+    ),
+  );
   }
 }
